@@ -3,15 +3,13 @@ import "fake-indexeddb/auto";
 import { DbClient } from "../../packages/db/src/db-client.js";
 import type { ZerithDBConfig } from "../../packages/core/src/index.js";
 
-const testConfig: ZerithDBConfig = {
-  appId: "test-db-" + Math.random().toString(36).slice(2),
-};
-
 describe("DbClient — CollectionClient", () => {
   let db: DbClient;
 
   beforeEach(() => {
-    db = new DbClient(testConfig);
+    db = new DbClient({
+      appId: "test-db-" + Math.random().toString(36).slice(2),
+    } satisfies ZerithDBConfig);
   });
 
   afterEach(async () => {
@@ -152,6 +150,45 @@ describe("DbClient — CollectionClient", () => {
       expect(count).toBe(1);
       const remaining = await col.find({});
       expect(remaining).toHaveLength(1);
+    });
+
+    it("should remove a document by id", async () => {
+      const col = db.collection<{ title: string }>("tasks");
+      const { id } = await col.insert({ title: "remove me" });
+
+      const count = await col.delete(id);
+
+      expect(count).toBe(1);
+      expect(await col.find({})).toHaveLength(0);
+    });
+  });
+
+  describe("subscribe()", () => {
+    it("should emit the current snapshot and subsequent mutations", async () => {
+      const col = db.collection<{ title: string }>("subscribed");
+      const snapshots: string[][] = [];
+      let resolveInitialSnapshot: (() => void) | undefined;
+      const initialSnapshot = new Promise<void>((resolve) => {
+        resolveInitialSnapshot = resolve;
+      });
+
+      const unsubscribe = col.subscribe((docs) => {
+        snapshots.push(docs.map((doc) => doc.title));
+        resolveInitialSnapshot?.();
+        resolveInitialSnapshot = undefined;
+      });
+
+      await initialSnapshot;
+      await col.insert({ title: "alpha" });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await col.insert({ title: "beta" });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      unsubscribe();
+
+      expect(snapshots[0]).toEqual([]);
+      expect(snapshots).toContainEqual(["alpha"]);
+      expect(snapshots).toContainEqual(["alpha", "beta"]);
     });
   });
 

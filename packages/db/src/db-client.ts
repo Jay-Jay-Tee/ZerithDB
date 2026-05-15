@@ -14,8 +14,10 @@ import { ZerithDBError, ErrorCode } from "zerithdb-core";
  * All operations are async and backed by IndexedDB.
  */
 export class CollectionClient<T extends Record<string, any> = Record<string, any>> {
+  private readonly subscribers = new Set<(documents: Document<T>[]) => void>();
+
   constructor(
-    private readonly table: Table<Document<T>>,
+    private readonly getTable: () => Promise<Table<Document<T>>>,
     private readonly collectionName: string
   ) {}
 
@@ -34,7 +36,9 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
     };
 
     try {
-      await this.table.add(doc);
+      const table = await this.getTable();
+      await table.add(doc);
+      await this.notifySubscribers();
       return { id };
     } catch (err) {
       throw new ZerithDBError(
@@ -44,7 +48,6 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
       );
     }
   }
-
   /**
    * Insert multiple documents in a single atomic operation.
    */
@@ -58,7 +61,9 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
     })) as Document<T>[];
 
     try {
-      await this.table.bulkAdd(docs);
+      const table = await this.getTable();
+      await table.bulkAdd(docs);
+      await this.notifySubscribers();
       return docs.map((d) => ({ id: d._id }));
     } catch (err) {
       throw new ZerithDBError(
@@ -81,8 +86,9 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
    */
   async find(filter: QueryFilter<T> = {}): Promise<Document<T>[]> {
     try {
-      const all = await this.table.toArray();
-      return all.filter((doc) => this.matchesFilter(doc, filter));
+      const table = await this.getTable();
+      const all = await table.toArray();
+      return all.filter((doc: Document<T>) => this.matchesFilter(doc, filter));
     } catch (err) {
       throw new ZerithDBError(
         ErrorCode.DB_READ_FAILED,
@@ -97,7 +103,8 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
    */
   async findById(id: string): Promise<Document<T> | undefined> {
     try {
-      return await this.table.get(id);
+      const table = await this.getTable();
+      return await table.get(id);
     } catch (err) {
       throw new ZerithDBError(
         ErrorCode.DB_READ_FAILED,
@@ -116,7 +123,10 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
       const matches = await this.find(filter);
       const now = Date.now();
 
-      await this.table.bulkPut(matches.map((doc) => this.applyUpdateSpec(doc, spec, now)));
+      const table = await this.getTable();
+      await table.bulkPut(matches.map((doc) => this.applyUpdateSpec(doc, spec, now)));
+
+      await this.notifySubscribers();
 
       return matches.length;
     } catch (err) {
@@ -132,10 +142,16 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
    * Delete documents matching a filter.
    * Returns the number of deleted documents.
    */
-  async delete(filter: QueryFilter<T>): Promise<number> {
+  async delete(id: string): Promise<number>;
+  async delete(filter: QueryFilter<T>): Promise<number>;
+  async delete(target: QueryFilter<T> | string): Promise<number> {
+    const filter = typeof target === "string" ? ({ _id: target } as QueryFilter<T>) : target;
+
     try {
       const matches = await this.find(filter);
-      await this.table.bulkDelete(matches.map((d) => d._id));
+      const table = await this.getTable();
+      await table.bulkDelete(matches.map((d) => d._id));
+      await this.notifySubscribers();
       return matches.length;
     } catch (err) {
       throw new ZerithDBError(
@@ -151,7 +167,9 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
    */
   async clearAll(): Promise<void> {
     try {
-      await this.table.clear();
+      const table = await this.getTable();
+      await table.clear();
+      await this.notifySubscribers();
     } catch (err) {
       throw new ZerithDBError(
         ErrorCode.DB_DELETE_FAILED,
@@ -159,6 +177,28 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
         { cause: err }
       );
     }
+  }
+
+  /**
+   * Subscribe to collection snapshots.
+   * The callback receives the current documents immediately and after every mutation.
+   */
+  subscribe(callback: (documents: Document<T>[]) => void): () => void {
+    this.subscribers.add(callback);
+
+    void this.find({})
+      .then((documents) => {
+        if (this.subscribers.has(callback)) {
+          callback(documents);
+        }
+      })
+      .catch(() => {
+        // Best-effort initial snapshot; subsequent mutations still notify subscribers.
+      });
+
+    return () => {
+      this.subscribers.delete(callback);
+    };
   }
 
   /**
@@ -208,6 +248,21 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
     }
     return true;
   }
+
+  private async notifySubscribers(): Promise<void> {
+    if (this.subscribers.size === 0) return;
+
+    let documents: Document<T>[];
+    try {
+      documents = await this.find({});
+    } catch {
+      return;
+    }
+
+    for (const callback of this.subscribers) {
+      callback(documents);
+    }
+  }
 }
 
 class ZerithDBDexie extends Dexie {
@@ -217,8 +272,12 @@ class ZerithDBDexie extends Dexie {
     super(`zerithdb_${appId}`);
   }
 
-  ensureCollection(name: string): Table {
+  async ensureCollection(name: string): Promise<Table> {
     if (!this.tableMap.has(name)) {
+      if (this.isOpen()) {
+        this.close();
+      }
+
       // Dexie requires version upgrade to add tables — we use a dynamic schema pattern
       const version = (this.verno ?? 0) + 1;
       const existingTableNames = this.tableMap.keys();
@@ -227,7 +286,13 @@ class ZerithDBDexie extends Dexie {
         schema[existingName] = "_id, _createdAt, _updatedAt";
       }
       this.version(version).stores(schema);
-      this.tableMap.set(name, this.table(name));
+      for (const collectionName of Object.keys(schema)) {
+        this.tableMap.set(collectionName, this.table(collectionName));
+      }
+
+      await this.open();
+    } else if (!this.isOpen()) {
+      await this.open();
     }
     // biome-ignore lint: map guarantees this is defined
     return this.tableMap.get(name)!;
@@ -249,8 +314,13 @@ export class DbClient {
 
   collection<T extends Record<string, any>>(name: string): CollectionClient<T> {
     if (!this.collections.has(name)) {
-      const table = this.dexie.ensureCollection(name);
-      this.collections.set(name, new CollectionClient<T>(table as Table<Document<T>>, name));
+      this.collections.set(
+        name,
+        new CollectionClient<T>(
+          async () => (await this.dexie.ensureCollection(name)) as Table<Document<T>>,
+          name
+        )
+      );
     }
     return this.collections.get(name) as CollectionClient<T>;
   }

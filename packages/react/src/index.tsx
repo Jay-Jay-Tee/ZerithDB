@@ -1,9 +1,10 @@
 import React, { createContext, useContext, useEffect, useState, useMemo } from "react";
-import { createApp } from "zerithdb-sdk";
-import type { ZerithDBApp, ZerithDBConfig, QueryFilter } from "zerithdb-sdk";
-import { liveQuery } from "dexie";
+import type { ZerithDBConfig } from "zerithdb-sdk";
+import type { SharedWorkerApp } from "./shared-worker-protocol.js";
+import { createSharedWorkerApp } from "./shared-worker-app.js";
+import type { QueryFilter } from "./shared-worker-protocol.js";
 
-const ZerithContext = createContext<ZerithDBApp | null>(null);
+const ZerithContext = createContext<SharedWorkerApp | null>(null);
 
 export interface ZerithProviderProps {
   config: ZerithDBConfig;
@@ -15,7 +16,7 @@ export interface ZerithProviderProps {
  * Initializes the P2P client and makes it available via hooks.
  */
 export const ZerithProvider: React.FC<ZerithProviderProps> = ({ config, children }) => {
-  const client = useMemo(() => createApp(config), [JSON.stringify(config)]);
+  const client = useMemo(() => createSharedWorkerApp(config), [JSON.stringify(config)]);
 
   return <ZerithContext.Provider value={client}>{children}</ZerithContext.Provider>;
 };
@@ -23,7 +24,7 @@ export const ZerithProvider: React.FC<ZerithProviderProps> = ({ config, children
 /**
  * Access the underlying ZerithDB app client directly.
  */
-export const useZerith = (): ZerithDBApp => {
+export const useZerith = (): SharedWorkerApp => {
   const context = useContext(ZerithContext);
   if (!context) {
     throw new Error("useZerith must be used within a ZerithProvider");
@@ -55,25 +56,30 @@ export function useQuery<T extends Record<string, any>>(collectionName: string, 
   const memoizedFilter = useDeepCompareMemoize(filter);
 
   useEffect(() => {
+    let mounted = true;
+
     const collection = app.db<T>(collectionName);
-    
-    // Use Dexie's liveQuery to reactively observe local DB changes
-    // (which also includes remote P2P updates applied by the sync engine)
-    const observable = liveQuery(() => collection.find(memoizedFilter));
-    
-    const subscription = observable.subscribe({
-      next: (docs) => {
-        setData(docs as T[]);
-        setLoading(false);
-      },
-      error: (err) => {
-        setError(err);
-        setLoading(false);
-      }
+
+    // Subscribe to real-time updates (SharedWorker broadcasts updates to all tabs).
+    // When a mutation fires, re-fetch with the server-side filter for accurate results.
+    const unsubscribe = collection.subscribe(() => {
+      if (!mounted) return;
+      void collection.find(memoizedFilter).then((docs) => {
+        if (mounted) {
+          setData(docs as T[]);
+          setLoading(false);
+        }
+      }).catch((err: Error) => {
+        if (mounted) {
+          setError(err);
+          setLoading(false);
+        }
+      });
     });
 
     return () => {
-      subscription.unsubscribe();
+      mounted = false;
+      unsubscribe();
     };
   }, [app, collectionName, memoizedFilter]);
 
@@ -82,10 +88,7 @@ export function useQuery<T extends Record<string, any>>(collectionName: string, 
   };
 
   const remove = async (id: string) => {
-    const collection = app.db<T>(collectionName);
-    type DeleteFilter = Parameters<typeof collection.delete>[0];
-    const deleteFilter = { _id: id } as unknown as DeleteFilter;
-    return collection.delete(deleteFilter);
+    return app.db<T>(collectionName).delete(id);
   };
 
   return { data, loading, error, insert, remove };
@@ -99,17 +102,15 @@ export function useSync() {
   const [state, setState] = useState(() => app.sync.state);
 
   useEffect(() => {
-    const handleStateChange = (newState: any) => setState(newState);
-    app.sync.on("state:change", handleStateChange);
-    return () => {
-      app.sync.off("state:change", handleStateChange);
-    };
+    // SharedWorkerBridge updates syncState via worker messages; poll to reflect changes in React
+    const interval = setInterval(() => setState(app.sync.state), 1000);
+    return () => clearInterval(interval);
   }, [app]);
 
   return {
     state,
     enable: () => app.sync.enable(),
-    disable: () => app.sync.disable()
+    disable: () => app.sync.disable(),
   };
 }
 
@@ -121,23 +122,18 @@ export function useAuth() {
   const [identity, setIdentity] = useState(() => app.auth.identity);
 
   useEffect(() => {
-    const handleIdentityChange = (newIdentity: any) => setIdentity(newIdentity);
-    app.auth.on("identity:change", handleIdentityChange);
-    // Initialize in case it changed between render and effect
     setIdentity(app.auth.identity);
-    return () => {
-      app.auth.off("identity:change", handleIdentityChange);
-    };
   }, [app]);
 
   const signIn = async () => {
     const id = await app.auth.signIn();
-    // No need to setIdentity here, the event listener will handle it
+    setIdentity(id);
     return id;
   };
 
-  const signOut = async () => {
-    await app.auth.signOut();
+  const signOut = () => {
+    app.auth.signOut();
+    setIdentity(null);
   };
 
   return { identity, signIn, signOut };

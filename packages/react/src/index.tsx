@@ -1,8 +1,7 @@
 import React, { createContext, useContext, useEffect, useState, useMemo } from "react";
-import type { ZerithDBConfig } from "zerithdb-sdk";
+import type { ZerithDBConfig, QueryFilter } from "zerithdb-sdk";
 import type { SharedWorkerApp } from "./shared-worker-protocol.js";
 import { createSharedWorkerApp } from "./shared-worker-app.js";
-import type { QueryFilter } from "./shared-worker-protocol.js";
 
 const ZerithContext = createContext<SharedWorkerApp | null>(null);
 

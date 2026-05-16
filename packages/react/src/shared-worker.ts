@@ -133,7 +133,7 @@ async function handleRequest(context: AppContext, message: RequestMessage): Prom
     }
 
     const collection = context.app.db(message.collectionName);
-    return await invoke(collection, message.method, message.args);
+    return await invoke(collection as unknown as Record<string, unknown>, message.method, message.args);
   }
 
   return await invoke((context.app as unknown as Record<string, unknown>)[message.scope] as Record<string, unknown>, message.method, message.args);

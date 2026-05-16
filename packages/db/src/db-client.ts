@@ -145,7 +145,7 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
   async delete(id: string): Promise<number>;
   async delete(filter: QueryFilter<T>): Promise<number>;
   async delete(target: QueryFilter<T> | string): Promise<number> {
-    const filter = typeof target === "string" ? ({ _id: target } as QueryFilter<T>) : target;
+    const filter = typeof target === "string" ? ({ _id: target } as unknown as QueryFilter<T>) : target;
 
     try {
       const matches = await this.find(filter);

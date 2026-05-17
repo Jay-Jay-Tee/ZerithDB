@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { EventEmitter } from "../../packages/core/src/internal/event-emitter.js";
-import { ZerithDBError, ErrorCode } from "../../packages/core/src/internal/errors.js";
+import { ZerithDBError, ErrorCode } from "../../packages/errors/src/index.js";
 
 // ─── EventEmitter ─────────────────────────────────────────────────────────────
 
